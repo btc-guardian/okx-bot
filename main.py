@@ -285,7 +285,10 @@ async def monitor_loop() -> None:
             "Keep-alive HTTP server aktywny na porcie 8080.",
             disable_notification=False,
         )
-await send_telegram(session, "🚨 TEST KOŃCOWY: Bot działa, serwer żyje, alerty dochodzą!", disable_notification=False)
+
+        # Nasz testowy powiadamiacz (z poprawnym wcięciem!)
+        await send_telegram(session, "🚨 TEST KOŃCOWY: Bot działa, serwer żyje, alerty dochodzą!", disable_notification=False)
+
         while True:
             log.info("Running checks…")
             try:
