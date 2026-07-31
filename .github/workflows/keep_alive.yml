@@ -1,0 +1,15 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    # Uruchamiaj co 10 minut
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render Bot
+        run: |
+          curl -s https://okx-bot-2707.onrender.com/ping
