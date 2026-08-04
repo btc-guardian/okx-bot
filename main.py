@@ -28,284 +28,260 @@ DEFILLAMA_URL = "https://api.llama.fi/protocol/okx"
 REPORT_HOURS = {8, 12, 16, 20}
 WARSAW_TZ = zoneinfo.ZoneInfo("Europe/Warsaw")
 
-# ── State ─────────────────────────────────────────────────────────────────────
+# --- State --------------------------------------------------------------------
 
 RESERVE_HISTORY: dict[str, float] = {}
 
-# Keys of alerts already sent – prevents re-sending the same alert every 2 min.
+# Keys of alerts already sent - prevents re-sending the same alert every 2 min.
 SENT_ALERT_KEYS: set[str] = set()
 
 # Track which report hours have already been sent today.
 SENT_REPORT_HOURS: set[tuple[datetime.date, int]] = set()
 
 # Titles containing any of these substrings are silently ignored (case-insensitive).
-IGNORED_MAINTENANCE_KEYWORDS = ["copy trading"]
+IGNORE_TITLES = []
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def is_critical(alert_key: str) -> bool:
-    """Return True for alerts that require the KRYTYCZNY ALERT prefix."""
-    return alert_key.startswith(("reserve_drop:", "okx_withdrawal_disabled:"))
-
-
-def format_alert(alert_key: str, message: str) -> str:
-    prefix = "🔴 <b>[KRYTYCZNY ALERT - DZIAŁAJ]</b>\n" if is_critical(alert_key) else ""
-    return prefix + message
-
-
-# ── Telegram ──────────────────────────────────────────────────────────────────
-
-async def send_telegram(
-    session: aiohttp.ClientSession,
-    text: str,
-    disable_notification: bool = False,
-) -> None:
-    """
-    Send a Telegram message.
-    - disable_notification=False  → normal delivery with sound (for critical alerts)
-    - disable_notification=True   → silent delivery (for status reports)
-    """
+async def send_telegram(text: str, silent: bool = True) -> bool:
+    """Send a message to Telegram. Defaults to silent notifications."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set – skipping message.")
-        return
+        log.warning("Telegram token or chat ID not set. Message skipped.")
+        return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_notification": disable_notification,
+        "disable_notification": silent,
     }
+
     try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                log.error("Telegram error %s: %s", resp.status, body)
-            else:
-                mode = "silent" if disable_notification else "with sound"
-                log.info("Telegram message sent (%s).", mode)
-    except Exception as exc:
-        log.error("Failed to send Telegram message: %s", exc)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=10) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.error(f"Telegram API error {resp.status}: {body}")
+                    return False
+                return True
+    except Exception as e:
+        log.error(f"Failed to send Telegram message: {e}")
+        return False
 
 
-# ── Daily status report ───────────────────────────────────────────────────────
-
-async def maybe_send_status_report(session: aiohttp.ClientSession) -> None:
-    """Send a silent status report at configured hours in Europe/Warsaw time (once per slot)."""
-    now = datetime.datetime.now(WARSAW_TZ)
-    slot = (now.date(), now.hour)
-    if now.hour in REPORT_HOURS and slot not in SENT_REPORT_HOURS:
-        SENT_REPORT_HOURS.add(slot)
-        log.info("Sending scheduled status report for %s (Warsaw time).", slot)
-        await send_telegram(
-            session,
-            "🟢 <b>[STATUS]</b> Bot działa poprawnie. Monitoring OKX i rezerw jest aktywny.",
-            disable_notification=True,
-        )
-
-
-# ── OKX system status ─────────────────────────────────────────────────────────
-
-async def check_okx_status(session: aiohttp.ClientSession) -> tuple[str, list[tuple[str, str]]]:
-    """
-    Query OKX public /api/v5/system/status.
-    Returns (summary, list_of_(alert_key, alert_message)).
-    Ignores maintenance entries matching IGNORED_MAINTENANCE_KEYWORDS.
-    """
-    t0 = time.monotonic()
+async def check_okx_status(session: aiohttp.ClientSession) -> list[str]:
+    """Fetch system status from OKX API and return alert messages for ongoing/scheduled maintenance."""
+    alerts = []
     try:
-        async with session.get(OKX_STATUS_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            latency_ms = int((time.monotonic() - t0) * 1000)
+        async with session.get(OKX_STATUS_URL, timeout=10) as resp:
             if resp.status != 200:
-                key = f"okx_api_error:{resp.status}"
-                msg = f"🚨 OKX API niedostępne: HTTP {resp.status}"
-                return f"⚠️ OKX API error: HTTP {resp.status} (latency {latency_ms} ms)", [(key, msg)]
+                log.error(f"OKX status API returned HTTP {resp.status}")
+                key = f"okx_http_{resp.status}"
+                if key not in SENT_ALERT_KEYS:
+                    alerts.append(f"🚨 OKX API niedostępne: HTTP {resp.status}")
+                    SENT_ALERT_KEYS.add(key)
+                return alerts
+
             data = await resp.json()
-    except asyncio.TimeoutError:
-        key = "okx_api_timeout"
-        return "⚠️ OKX API timeout after 15 s", [(key, "🚨 OKX API timeout")]
-    except Exception as exc:
-        key = "okx_api_exception"
-        return f"⚠️ OKX API request failed: {exc}", [(key, f"🚨 OKX API błąd: {exc}")]
+            if data.get("code") != "0":
+                log.error(f"OKX status API error code: {data.get('code')}")
+                return alerts
 
-    entries = data.get("data", [])
-    DISRUPTION = {"scheduled", "ongoing", "pre_open"}
-    active = [e for e in entries if e.get("state") in DISRUPTION]
+            items = data.get("data", [])
+            current_keys = set()
 
-    active_maintenance_keys: set[str] = set()
-    lines = [f"📡 <b>OKX system status</b> (latency: {latency_ms} ms)"]
-    alerts: list[tuple[str, str]] = []
+            for item in items:
+                title = item.get("title", "")
+                state = item.get("state", "")  # 'scheduled', 'ongoing', 'completed'
+                service_type = item.get("serviceType", "")
+                sched_beg = item.get("schedBeg", "")
+                sched_end = item.get("schedEnd", "")
 
-    visible_active = []
-    for e in active:
-        title = e.get("title", "Nieznane zdarzenie")
-        if any(kw in title.lower() for kw in IGNORED_MAINTENANCE_KEYWORDS):
-            log.debug("Ignoring maintenance: %s", title)
-            continue
-        visible_active.append(e)
+                # Ignore titles on the blacklist
+                if any(ign.lower() in title.lower() for ign in IGNORE_TITLES):
+                    continue
 
-    if not visible_active:
-        lines.append("  ✅ Brak aktywnych przerw technicznych")
-    else:
-        for e in visible_active:
-            title = e.get("title", "Nieznane zdarzenie")
-            state = e.get("state", "?")
-            begin = e.get("begin", "?")
-            end = e.get("end", "?")
-            lines.append(f"  🔴 [{state.upper()}] {title}  ({begin} → {end})")
-            key = f"okx_maintenance:{title}"
-            active_maintenance_keys.add(key)
-            alerts.append((key, f"🚨 OKX maintenance: {title} (stan: {state})"))
+                # Only alert on 'ongoing' or 'scheduled'
+                if state in ("ongoing", "scheduled"):
+                    alert_key = f"okx_maint_{title}_{sched_beg}"
+                    current_keys.add(alert_key)
 
-    lines.append("  ℹ️ Status wypłat USDT/BTC/ETH: wymaga klucza API OKX")
+                    if alert_key not in SENT_ALERT_KEYS:
+                        state_label = "TRWA" if state == "ongoing" else "zaplanowano"
+                        msg = (
+                            f"🚨 <b>OKX maintenance: {title}</b> (stan: {state})\n"
+                            f"Usługa: {service_type}\n"
+                            f"Czas: {sched_beg} - {sched_end}"
+                        )
+                        alerts.append(msg)
+                        SENT_ALERT_KEYS.add(alert_key)
 
-    # Remove keys for resolved maintenance so future recurrences alert again.
-    stale = {k for k in SENT_ALERT_KEYS if k.startswith("okx_maintenance:")} - active_maintenance_keys
-    for k in stale:
-        SENT_ALERT_KEYS.discard(k)
-        log.info("Cleared resolved maintenance alert key: %s", k)
+            # Cleanup resolved maintenance keys
+            keys_to_remove = {k for k in SENT_ALERT_KEYS if k.startswith("okx_maint_") and k not in current_keys}
+            SENT_ALERT_KEYS.difference_update(keys_to_remove)
 
-    return "\n".join(lines), alerts
+    except Exception as e:
+        log.error(f"Error checking OKX status: {e}")
+
+    return alerts
 
 
-# ── DefiLlama reserves ─────────────────────────────────────────────────────────
-
-async def check_defillama_reserves(session: aiohttp.ClientSession) -> tuple[str, list[tuple[str, str]]]:
-    """
-    Fetch OKX on-chain reserves from DefiLlama.
-    Alerts (once) if TVL drops more than 3% vs the previous reading.
-    """
+async def check_defillama_reserves(session: aiohttp.ClientSession) -> list[str]:
+    """Fetch OKX reserve data from DefiLlama and check for significant drops (>5%)."""
+    alerts = []
     try:
-        async with session.get(DEFILLAMA_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(DEFILLAMA_URL, timeout=15) as resp:
             if resp.status != 200:
-                return f"⚠️ DefiLlama API error: HTTP {resp.status}", []
+                log.error(f"DefiLlama API returned HTTP {resp.status}")
+                return alerts
+
             data = await resp.json()
-    except asyncio.TimeoutError:
-        return "⚠️ DefiLlama API timeout after 15 s", []
-    except Exception as exc:
-        return f"⚠️ DefiLlama request failed: {exc}", []
+            # Extract latest token balances from chainData / current reserves
+            tokens = data.get("currentChainBalances", {})
+            # Also check tokens in 'chainTvls' or 'tokens' if available
+            # DefiLlama protocol endpoint structure:
+            # data['tokens'] -> array of token objects or data['currentChainBalances']
+            # We look for token USD values or quantities.
 
-    tvl_current = data.get("currentChainTvls") or {}
-    total_tvl = sum(tvl_current.values()) if tvl_current else data.get("tvl", 0)
-    if total_tvl == 0:
-        tvl_list = data.get("tvl", [])
-        if tvl_list:
-            total_tvl = tvl_list[-1].get("totalLiquidityUSD", 0)
+            # Alternative: parse 'tokens' array if present
+            token_data = data.get("tokens", [])
+            current_balances: dict[str, float] = {}
 
-    alerts: list[tuple[str, str]] = []
-    prev = RESERVE_HISTORY.get("total_tvl")
-    direction = ""
+            if isinstance(token_data, list):
+                for entry in token_data:
+                    # Look for the latest date entry
+                    date_tokens = entry.get("tokens", {})
+                    for symbol, amount in date_tokens.items():
+                        symbol_upper = symbol.upper()
+                        if symbol_upper in TRACKED_CURRENCIES:
+                            current_balances[symbol_upper] = float(amount)
 
-    if prev and prev > 0:
-        change_pct = (total_tvl - prev) / prev * 100
-        direction = f" ({change_pct:+.2f}% vs prev)"
-        if change_pct <= -3:
-            key = f"reserve_drop:{prev:.0f}:{total_tvl:.0f}"
-            msg = (
-                f"🚨 OKX rezerwy on-chain spadły o <b>{change_pct:.2f}%</b>\n"
-                f"Poprzednio: <b>${prev:,.0f}</b> → Teraz: <b>${total_tvl:,.0f}</b>"
-            )
-            alerts.append((key, msg))
+            # Fallback: check currentChainBalances
+            if not current_balances and isinstance(tokens, dict):
+                for chain, chain_tokens in tokens.items():
+                    if isinstance(chain_tokens, dict):
+                        for symbol, amount in chain_tokens.items():
+                            symbol_upper = symbol.upper()
+                            if symbol_upper in TRACKED_CURRENCIES:
+                                current_balances[symbol_upper] = (
+                                    current_balances.get(symbol_upper, 0.0) + float(amount)
+                                )
 
-    RESERVE_HISTORY["total_tvl"] = total_tvl
+            # Compare with history
+            for symbol, current_val in current_balances.items():
+                if symbol in RESERVE_HISTORY:
+                    prev_val = RESERVE_HISTORY[symbol]
+                    if prev_val > 0:
+                        pct_change = ((current_val - prev_val) / prev_val) * 100
+                        if pct_change <= -5.0:
+                            alert_key = f"reserve_drop_{symbol}_{datetime.datetime.now().strftime('%Y%m%d_%H')}"
+                            if alert_key not in SENT_ALERT_KEYS:
+                                msg = (
+                                    f"⚠️ <b>ALERT REZERW: Spadek {symbol} o {abs(pct_change):.1f}%!</b>\n"
+                                    f"Poprzednio: {prev_val:,.2f} -> Teraz: {current_val:,.2f}"
+                                )
+                                alerts.append(msg)
+                                SENT_ALERT_KEYS.add(alert_key)
 
-    summary = (
-        f"🏦 <b>OKX on-chain reserves (DefiLlama)</b>\n"
-        f"  Total TVL: <b>${total_tvl:,.0f}</b>{direction}"
-    )
-    return summary, alerts
+                RESERVE_HISTORY[symbol] = current_val
 
+    except Exception as e:
+        log.error(f"Error checking DefiLlama reserves: {e}")
 
-# ── Keep-alive HTTP server ────────────────────────────────────────────────────
-
-async def handle_ping(request: web.Request) -> web.Response:
-    now = datetime.datetime.now(WARSAW_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-    return web.Response(
-        text=f"OK — OKX Monitor działa | {now}",
-        content_type="text/plain",
-    )
-
-async def start_http_server() -> None:
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/ping", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    log.info("Keep-alive HTTP server running on port 8080")
-
-
-# ── Main loop ─────────────────────────────────────────────────────────────────
-
-async def run_checks(session: aiohttp.ClientSession) -> None:
-    okx_summary, okx_alerts = await check_okx_status(session)
-    dl_summary, dl_alerts = await check_defillama_reserves(session)
-
-    log.info("\n%s\n%s", okx_summary, dl_summary)
-
-    all_alerts = okx_alerts + dl_alerts
-    new_alerts = [(key, msg) for key, msg in all_alerts if key not in SENT_ALERT_KEYS]
-
-    if new_alerts:
-        for key, msg in new_alerts:
-            formatted = format_alert(key, msg)
-            log.warning("NEW ALERT [%s]: %s", key, msg)
-            # Critical alerts: disable_notification=False → sound + priority
-            await send_telegram(
-                session,
-                formatted,
-                disable_notification=not is_critical(key),
-            )
-            SENT_ALERT_KEYS.add(key)
-    else:
-        if all_alerts:
-            log.info(
-                "Alerts present but already sent – skipping. Keys: %s",
-                [k for k, _ in all_alerts],
-            )
+    return alerts
 
 
-async def monitor_loop() -> None:
-    if not TELEGRAM_TOKEN:
-        log.warning("TELEGRAM_TOKEN is not set!")
-    if not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_CHAT_ID is not set!")
+async def monitor_loop():
+    """Main monitoring loop that runs every CHECK_INTERVAL seconds."""
+    log.info("Starting OKX & Reserve monitoring loop...")
 
-    connector = aiohttp.TCPConnector(limit=10)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        await send_telegram(
-            session,
-            "👋 <b>OKX Monitor uruchomiony</b>\n"
-            "Sprawdzam co 2 minuty:\n"
-            "  • Status systemu OKX (przerwy techniczne)\n"
-            "  • Rezerwy on-chain via DefiLlama\n\n"
-            "Raporty statusowe: 08:00, 12:00, 16:00, 20:00 czasu PL (ciche).\n"
-            "Alerty krytyczne wysyłane z dźwiękiem.\n"
-            "Keep-alive HTTP server aktywny na porcie 8080.",
-            disable_notification=False,
-        )
-
-        # Nasz testowy powiadamiacz (z poprawnym wcięciem!)
-        await send_telegram(session, "🚨 TEST KOŃCOWY: Bot działa, serwer żyje, alerty dochodzą!", disable_notification=False)
-
+    async with aiohttp.ClientSession() as session:
         while True:
-            log.info("Running checks…")
             try:
-                await maybe_send_status_report(session)
-                await run_checks(session)
-            except Exception as exc:
-                log.error("Unexpected error during checks: %s", exc)
-            log.info("Sleeping %d s…", CHECK_INTERVAL)
+                now_warsaw = datetime.datetime.now(WARSAW_TZ)
+
+                # 1. Check OKX system status
+                okx_alerts = await check_okx_status(session)
+                for alert in okx_alerts:
+                    # Alerty czerwone 🚨 wyczyszczone z silent=False -> GŁOŚNO!
+                    await send_telegram(alert, silent=False)
+
+                # 2. Check DefiLlama reserves
+                llama_alerts = await check_defillama_reserves(session)
+                for alert in llama_alerts:
+                    # Alerty rezerw ⚠️ -> GŁOŚNO!
+                    await send_telegram(alert, silent=False)
+
+                # 3. Scheduled status report (08:00, 12:00, 16:00, 20:00 Warsaw time)
+                today = now_warsaw.date()
+                current_hour = now_warsaw.hour
+
+                if current_hour in REPORT_HOURS:
+                    report_key = (today, current_hour)
+                    if report_key not in SENT_REPORT_HOURS:
+                        report_msg = (
+                            f"🟢 <b>[STATUS] Bot działa poprawnie.</b>\n"
+                            f"Monitoring OKX i rezerw jest aktywny."
+                        )
+                        # Raport zielony 🟢 z silent=True -> CICHO!
+                        await send_telegram(report_msg, silent=True)
+                        SENT_REPORT_HOURS.add(report_key)
+
+                        # Clean up old report keys from previous days
+                        old_keys = {k for k in SENT_REPORT_HOURS if k[0] < today}
+                        SENT_REPORT_HOURS.difference_update(old_keys)
+
+            except Exception as e:
+                log.error(f"Unexpected error in monitor loop: {e}")
+
             await asyncio.sleep(CHECK_INTERVAL)
 
 
-async def main() -> None:
-    await asyncio.gather(
-        start_http_server(),
-        monitor_loop(),
+# --- Web Server for Keep-Alive ------------------------------------------------
+
+async def handle_root(request):
+    return web.Response(text="OKX Monitor Bot is running.")
+
+
+async def handle_health(request):
+    return web.json_response({"status": "ok", "timestamp": time.time()})
+
+
+def create_web_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/health", handle_health)
+    return app
+
+
+async def main():
+    # Send startup message
+    startup_msg = (
+        "👋 <b>OKX Monitor uruchomiony</b>\n"
+        "Sprawdzam co 2 minuty:\n"
+        "• Status systemu OKX (przerwy techniczne)\n"
+        "• Rezerwy on-chain via DefiLlama\n\n"
+        "Raporty statusowe: 08:00, 12:00, 16:00, 20:00 czasu PL (ciche).\n"
+        "Alerty krytyczne wysyłane z dźwiękiem."
     )
+    # Startowa wiadomość wysyłana cicho
+    await send_telegram(startup_msg, silent=True)
+
+    # Start the web server (Render binds to PORT env var)
+    port = int(os.environ.get("PORT", 8080))
+    app = create_web_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Web server started on port {port}")
+
+    # Start the monitoring task
+    await monitor_loop()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Bot stopped by user.")
