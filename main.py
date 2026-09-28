@@ -25,7 +25,7 @@ OKX_STATUS_URL = "https://www.okx.com/api/v5/system/status"
 DEFILLAMA_URL = "https://api.llama.fi/protocol/okx"
 
 # Hours in Europe/Warsaw time at which daily status reports are sent.
-REPORT_HOURS = {6, 8, 10, 12, 14, 16, 18, 20, 22}
+REPORT_HOURS = {2,4,6, 8, 10, 12, 14, 16, 18, 20, 22,24}
 WARSAW_TZ = zoneinfo.ZoneInfo("Europe/Warsaw")
 
 # --- State --------------------------------------------------------------------
