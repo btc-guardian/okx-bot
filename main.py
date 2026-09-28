@@ -25,7 +25,7 @@ OKX_STATUS_URL = "https://www.okx.com/api/v5/system/status"
 DEFILLAMA_URL = "https://api.llama.fi/protocol/okx"
 
 # Hours in Europe/Warsaw time at which daily status reports are sent.
-REPORT_HOURS = {2,4,6, 8, 10, 12, 14, 16, 18, 20, 22,24}
+REPORT_HOURS = {2,4,6,8,10,12,14,16,18,20,22,24}
 WARSAW_TZ = zoneinfo.ZoneInfo("Europe/Warsaw")
 
 # --- State --------------------------------------------------------------------
@@ -261,7 +261,7 @@ async def main():
         "Sprawdzam co 2 minuty:\n"
         "• Status systemu OKX (przerwy techniczne)\n"
         "• Rezerwy on-chain via DefiLlama\n\n"
-        "Raporty statusowe: 08:00, 12:00, 16:00, 20:00 czasu PL (ciche).\n"
+        "Raporty statusowe: 02:00,04:00,06:00,08:00,10:00,12:00,14:00,16:00,18:00,20:00,22:00,24:00 czasu PL (ciche).\n"
         "Alerty krytyczne wysyłane z dźwiękiem."
     )
     # Startowa wiadomość wysyłana cicho
